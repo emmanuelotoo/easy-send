@@ -26,12 +26,3 @@ export function toLocal(phone: string): string {
   return `${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`;
 }
 
-/** Format as WhatsApp JID: 233XXXXXXXXX@s.whatsapp.net */
-export function toJid(phone: string): string {
-  return `${toInternational(phone)}@s.whatsapp.net`;
-}
-
-/** Extract the raw number from a WhatsApp JID */
-export function fromJid(jid: string): string {
-  return jid.split('@')[0];
-}
