@@ -1,7 +1,7 @@
-import { config, validateConfig } from './config';
+import { validateConfig } from './config';
 import { runMigrations, closeDb } from './db/client';
 import { seedContacts } from './contacts/store';
-import { startWhatsApp } from './whatsapp/connection';
+import { startTelegram, stopTelegram } from './telegram/bot';
 import { initPaymentProvider } from './conversation/flows';
 import { logger } from './utils/logger';
 import fs from 'fs';
@@ -27,15 +27,16 @@ async function main() {
   // Resolve Telecel bank code from Paystack
   await initPaymentProvider();
 
-  // Start WhatsApp connection
-  await startWhatsApp();
+  // Start Telegram bot
+  await startTelegram();
 
-  logger.info('Easy-Send is running. Waiting for WhatsApp messages...');
+  logger.info('Easy-Send is running. Waiting for Telegram messages...');
 }
 
 // Graceful shutdown
 function shutdown() {
   logger.info('Shutting down...');
+  stopTelegram();
   closeDb();
   process.exit(0);
 }
