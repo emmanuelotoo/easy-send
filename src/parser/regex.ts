@@ -1,7 +1,7 @@
 import { ParsedCommand } from './types';
 
 /**
- * Parse a WhatsApp message into a structured command using regex.
+ * Parse a message into a structured command using regex.
  *
  * Supported patterns:
  *   "send 50 to Kojo"
