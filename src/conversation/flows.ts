@@ -3,17 +3,23 @@ import { resolveRecipient } from '../contacts/resolver';
 import { findContactByNickname, getAllContacts, addContact, updateRecipientCode } from '../contacts/store';
 import { validateAmount } from '../payment/validator';
 import { toPesewas, formatGHS } from '../utils/money';
-import { toLocal } from '../utils/phone';
+import { toLocal, toInternational } from '../utils/phone';
 import {
   generateReference,
   getGHSBalance,
   createRecipient as createPaystackRecipient,
   initiateTransfer,
   resolveTelecelCode,
+  chargeMobileMoney,
+  submitChargeOTP,
+  checkPendingCharge,
 } from '../payment/paystack';
 import {
+  PendingTransfer,
   setAwaitingConfirmation,
+  setAwaitingVoucher,
   getPendingTransfer,
+  getPendingCharge,
   clearPending,
   isAwaitingConfirmation,
 } from './state';
@@ -116,62 +122,213 @@ export async function handleConfirmation(
       throw new Error('Telecel bank code not resolved. Cannot process transfer.');
     }
 
-    // Create Paystack recipient if not yet created
-    let recipientCode = pending.recipientCode;
-    if (!recipientCode) {
-      await sendReply('Setting up recipient...');
-      const recipient = await createPaystackRecipient(
-        pending.contactNickname,
-        pending.phone,
-        telecelBankCode
-      );
-      recipientCode = recipient.recipient_code;
-      updateRecipientCode(pending.contactId, recipientCode);
-    }
-
-    // Check balance
+    // Check balance — auto-fund if insufficient
     const balancePesewas = await getGHSBalance();
     if (balancePesewas < pending.amountPesewas) {
-      db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(pending.reference);
-      await sendReply(
-        `Insufficient Paystack balance.\n` +
-        `Balance: ${formatGHS(balancePesewas)}\n` +
-        `Required: ${formatGHS(pending.amountPesewas)}`
-      );
+      await startAutoFund(pending, balancePesewas, sendReply);
       return;
     }
 
-    // Initiate transfer
-    const transfer = await initiateTransfer(
-      recipientCode,
-      pending.amountPesewas,
-      `Easy-Send to ${pending.contactNickname}`,
-      pending.reference
-    );
-
-    // Update transaction record
-    db.prepare(
-      `UPDATE transactions SET status = ?, paystack_transfer_code = ? WHERE paystack_reference = ?`
-    ).run(transfer.status, transfer.transfer_code, pending.reference);
-
-    const statusEmoji = transfer.status === 'success' ? 'sent' : 'processing';
-    await sendReply(
-      `Transfer ${statusEmoji}!\n\n` +
-      `To: ${pending.contactNickname}\n` +
-      `Amount: ${formatGHS(pending.amountPesewas)}\n` +
-      `Status: ${transfer.status}\n` +
-      `Ref: ${pending.reference}`
-    );
-
-    // Low balance alert
-    const newBalance = balancePesewas - pending.amountPesewas;
-    if (newBalance < toPesewas(config.lowBalanceAlertGHS)) {
-      await sendReply(`Low balance alert: ${formatGHS(newBalance)} remaining.`);
-    }
+    // Balance sufficient — transfer directly
+    await executeTransfer(pending, sendReply);
   } catch (err: any) {
     logger.error(err, 'Transfer failed');
     db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(pending.reference);
     await sendReply(`Transfer failed: ${err.message}`);
+  }
+}
+
+/** Initiate a mobile money charge to fund Paystack balance */
+async function startAutoFund(
+  pending: PendingTransfer,
+  currentBalancePesewas: number,
+  sendReply: (text: string) => Promise<void>
+): Promise<void> {
+  const deficit = pending.amountPesewas - currentBalancePesewas;
+
+  await sendReply(
+    `Insufficient Paystack balance (${formatGHS(currentBalancePesewas)}).\n` +
+    `Charging ${formatGHS(deficit)} from your Telecel wallet...`
+  );
+
+  const chargeRef = generateReference();
+  const phone = toInternational(config.ownerPhone);
+  const db = getDb();
+
+  // Store the charge reference on the transaction
+  db.prepare(
+    `UPDATE transactions SET charge_reference = ? WHERE paystack_reference = ?`
+  ).run(chargeRef, pending.reference);
+
+  try {
+    const charge = await chargeMobileMoney(
+      deficit,
+      phone,
+      config.ownerEmail,
+      chargeRef
+    );
+
+    if (charge.status === 'success') {
+      // Charge completed immediately (unlikely for Vodafone but handle it)
+      await sendReply('Wallet charged successfully.');
+      await executeTransfer(pending, sendReply);
+      return;
+    }
+
+    if (charge.status === 'send_otp') {
+      // Vodafone flow: user needs to generate a voucher
+      const instruction = charge.display_text ||
+        'Dial *110# on your phone → My Wallet → Generate Voucher. Send the voucher code here.';
+
+      setAwaitingVoucher(
+        { chargeReference: chargeRef, transfer: pending },
+        async () => {
+          await sendReply('Voucher timed out — transfer cancelled.');
+          db.prepare("UPDATE transactions SET status = 'cancelled' WHERE paystack_reference = ?").run(pending.reference);
+        }
+      );
+
+      await sendReply(instruction);
+      return;
+    }
+
+    if (charge.status === 'pay_offline') {
+      // MTN-style flow: user approves on phone, we poll
+      const instruction = charge.display_text ||
+        'Approve the payment prompt on your phone.';
+
+      setAwaitingVoucher(
+        { chargeReference: chargeRef, transfer: pending },
+        async () => {
+          await sendReply('Payment approval timed out — transfer cancelled.');
+          db.prepare("UPDATE transactions SET status = 'cancelled' WHERE paystack_reference = ?").run(pending.reference);
+        }
+      );
+
+      await sendReply(instruction + '\n\nSend *done* once you have approved.');
+      return;
+    }
+
+    // Unexpected status
+    throw new Error(`Unexpected charge status: ${charge.status}`);
+  } catch (err: any) {
+    logger.error(err, 'Auto-fund charge failed');
+    db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(pending.reference);
+    await sendReply(`Could not charge wallet: ${err.message}`);
+  }
+}
+
+/** Handle voucher/OTP submission or "done" for pay_offline */
+export async function handleVoucher(
+  text: string,
+  sendReply: (text: string) => Promise<void>
+): Promise<void> {
+  const pendingCharge = getPendingCharge();
+  if (!pendingCharge) {
+    await sendReply('No pending charge to complete.');
+    return;
+  }
+
+  const { chargeReference, transfer } = pendingCharge;
+  clearPending();
+  const db = getDb();
+
+  try {
+    await sendReply('Processing...');
+
+    const otp = text.trim();
+    let charge;
+
+    if (/^\d+$/.test(otp)) {
+      // Numeric input → submit as OTP/voucher
+      charge = await submitChargeOTP(chargeReference, otp);
+    } else {
+      // Non-numeric (e.g. "done") → check pending status
+      charge = await checkPendingCharge(chargeReference);
+    }
+
+    if (charge.status === 'success') {
+      await sendReply('Wallet charged successfully.');
+      await executeTransfer(transfer, sendReply);
+      return;
+    }
+
+    if (charge.status === 'pending') {
+      // Still pending — poll once more after a short delay
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      charge = await checkPendingCharge(chargeReference);
+
+      if (charge.status === 'success') {
+        await sendReply('Wallet charged successfully.');
+        await executeTransfer(transfer, sendReply);
+        return;
+      }
+
+      db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(transfer.reference);
+      await sendReply(`Charge still pending. Please try the transfer again.\nRef: ${chargeReference}`);
+      return;
+    }
+
+    // Failed or unexpected
+    db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(transfer.reference);
+    await sendReply(`Charge failed (${charge.status}). Transfer cancelled.`);
+  } catch (err: any) {
+    logger.error(err, 'Voucher submission failed');
+    db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(transfer.reference);
+    await sendReply(`Charge failed: ${err.message}`);
+  }
+}
+
+/** Execute the actual Paystack transfer (shared by direct and auto-funded paths) */
+async function executeTransfer(
+  pending: PendingTransfer,
+  sendReply: (text: string) => Promise<void>
+): Promise<void> {
+  const db = getDb();
+
+  if (!telecelBankCode) {
+    throw new Error('Telecel bank code not resolved. Cannot process transfer.');
+  }
+
+  // Create Paystack recipient if not yet created
+  let recipientCode = pending.recipientCode;
+  if (!recipientCode) {
+    await sendReply('Setting up recipient...');
+    const recipient = await createPaystackRecipient(
+      pending.contactNickname,
+      pending.phone,
+      telecelBankCode
+    );
+    recipientCode = recipient.recipient_code;
+    updateRecipientCode(pending.contactId, recipientCode);
+  }
+
+  // Initiate transfer
+  const transfer = await initiateTransfer(
+    recipientCode,
+    pending.amountPesewas,
+    `Easy-Send to ${pending.contactNickname}`,
+    pending.reference
+  );
+
+  // Update transaction record
+  db.prepare(
+    `UPDATE transactions SET status = ?, paystack_transfer_code = ? WHERE paystack_reference = ?`
+  ).run(transfer.status, transfer.transfer_code, pending.reference);
+
+  const statusEmoji = transfer.status === 'success' ? 'sent' : 'processing';
+  await sendReply(
+    `Transfer ${statusEmoji}!\n\n` +
+    `To: ${pending.contactNickname}\n` +
+    `Amount: ${formatGHS(pending.amountPesewas)}\n` +
+    `Status: ${transfer.status}\n` +
+    `Ref: ${pending.reference}`
+  );
+
+  // Low balance alert
+  const newBalance = await getGHSBalance();
+  if (newBalance < toPesewas(config.lowBalanceAlertGHS)) {
+    await sendReply(`Low balance alert: ${formatGHS(newBalance)} remaining.`);
   }
 }
 
