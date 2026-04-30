@@ -27,3 +27,9 @@ export interface PaystackBank {
   code: string;
   type: string;
 }
+
+export interface PaystackCharge {
+  reference: string;
+  status: string; // "pay_offline", "send_otp", "pending", "success", "failed"
+  display_text?: string;
+}
