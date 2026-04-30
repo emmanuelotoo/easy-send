@@ -1,6 +1,6 @@
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { PaystackBalance, PaystackBank, PaystackRecipient, PaystackTransfer } from './types';
+import { PaystackBalance, PaystackBank, PaystackCharge, PaystackRecipient, PaystackTransfer } from './types';
 import crypto from 'crypto';
 
 const BASE_URL = 'https://api.paystack.co';
@@ -110,4 +110,39 @@ export async function initiateTransfer(
 /** Verify a transfer status */
 export async function verifyTransfer(reference: string): Promise<PaystackTransfer> {
   return paystackRequest<PaystackTransfer>('GET', `/transfer/verify/${reference}`);
+}
+
+/** Charge a mobile money wallet (Telecel/Vodafone: provider "vod") */
+export async function chargeMobileMoney(
+  amountPesewas: number,
+  phone: string,
+  email: string,
+  reference: string
+): Promise<PaystackCharge> {
+  return paystackRequest<PaystackCharge>('POST', '/charge', {
+    amount: amountPesewas,
+    email,
+    currency: 'GHS',
+    reference,
+    mobile_money: {
+      phone,
+      provider: 'vod',
+    },
+  });
+}
+
+/** Submit voucher code (OTP) for a pending mobile money charge */
+export async function submitChargeOTP(
+  reference: string,
+  otp: string
+): Promise<PaystackCharge> {
+  return paystackRequest<PaystackCharge>('POST', '/charge/submit_otp', {
+    reference,
+    otp,
+  });
+}
+
+/** Check the status of a pending charge */
+export async function checkPendingCharge(reference: string): Promise<PaystackCharge> {
+  return paystackRequest<PaystackCharge>('GET', `/charge/${reference}`);
 }
