@@ -30,6 +30,5 @@ export interface PaystackBank {
 
 export interface PaystackCharge {
   reference: string;
-  status: string; // "pay_offline", "send_otp", "pending", "success", "failed"
-  display_text?: string;
+  status: string; // "pay_offline", "pending", "success", "failed"
 }
