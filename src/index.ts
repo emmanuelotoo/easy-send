@@ -1,7 +1,7 @@
 import { validateConfig } from './config';
 import { runMigrations, closeDb } from './db/client';
 import { seedContacts } from './contacts/store';
-import { startTelegram, stopTelegram } from './telegram/bot';
+import { startWhatsapp, stopWhatsapp } from './whatsapp/connection';
 import { initPaymentProvider } from './conversation/flows';
 import { logger } from './utils/logger';
 import fs from 'fs';
@@ -10,13 +10,9 @@ import path from 'path';
 async function main() {
   logger.info('Starting Easy-Send...');
 
-  // Validate configuration
   validateConfig();
-
-  // Run database migrations
   runMigrations();
 
-  // Seed contacts from JSON if table is empty
   const contactsFile = path.join(process.cwd(), 'data', 'contacts.json');
   if (fs.existsSync(contactsFile)) {
     const contacts = JSON.parse(fs.readFileSync(contactsFile, 'utf-8'));
@@ -24,19 +20,15 @@ async function main() {
     logger.info('Contacts seeded: %d entries', contacts.length);
   }
 
-  // Resolve Telecel bank code from Paystack
   await initPaymentProvider();
+  await startWhatsapp();
 
-  // Start Telegram bot
-  await startTelegram();
-
-  logger.info('Easy-Send is running. Waiting for Telegram messages...');
+  logger.info('Easy-Send is running. Waiting for WhatsApp messages...');
 }
 
-// Graceful shutdown
 function shutdown() {
   logger.info('Shutting down...');
-  stopTelegram();
+  stopWhatsapp();
   closeDb();
   process.exit(0);
 }
