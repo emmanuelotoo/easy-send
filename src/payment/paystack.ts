@@ -40,39 +40,24 @@ export function generateReference(): string {
   return `easysend_${timestamp}_${random}`;
 }
 
-/** Get available Paystack balance */
-export async function getBalance(): Promise<PaystackBalance[]> {
-  return paystackRequest<PaystackBalance[]>('GET', '/balance');
-}
-
 /** Get GHS balance in pesewas */
 export async function getGHSBalance(): Promise<number> {
-  const balances = await getBalance();
+  const balances = await paystackRequest<PaystackBalance[]>('GET', '/balance');
   const ghs = balances.find(b => b.currency === 'GHS');
   return ghs?.balance ?? 0;
 }
 
-/** List supported mobile money banks/providers */
-export async function listMobileMoneyBanks(): Promise<PaystackBank[]> {
-  return paystackRequest<PaystackBank[]>('GET', '/bank?currency=GHS&type=mobile_money');
-}
+/** Find the MTN Mobile Money provider code dynamically */
+export async function resolveMtnCode(): Promise<string | null> {
+  const banks = await paystackRequest<PaystackBank[]>('GET', '/bank?currency=GHS&type=mobile_money');
+  const mtn = banks.find(b => b.name.toLowerCase().includes('mtn'));
 
-/** Find the Telecel Cash provider code dynamically */
-export async function resolveTelecelCode(): Promise<string | null> {
-  const banks = await listMobileMoneyBanks();
-  // Look for Telecel or Vodafone (Telecel was formerly Vodafone Ghana)
-  const telecel = banks.find(
-    b =>
-      b.name.toLowerCase().includes('telecel') ||
-      b.name.toLowerCase().includes('vodafone')
-  );
-
-  if (telecel) {
-    logger.info('Resolved Telecel provider code: %s (%s)', telecel.code, telecel.name);
-    return telecel.code;
+  if (mtn) {
+    logger.info('Resolved MTN provider code: %s (%s)', mtn.code, mtn.name);
+    return mtn.code;
   }
 
-  logger.error('Could not find Telecel/Vodafone in Paystack banks: %o', banks.map(b => b.name));
+  logger.error('Could not find MTN in Paystack banks: %o', banks.map(b => b.name));
   return null;
 }
 
@@ -107,12 +92,7 @@ export async function initiateTransfer(
   });
 }
 
-/** Verify a transfer status */
-export async function verifyTransfer(reference: string): Promise<PaystackTransfer> {
-  return paystackRequest<PaystackTransfer>('GET', `/transfer/verify/${reference}`);
-}
-
-/** Charge a mobile money wallet (Telecel/Vodafone: provider "vod") */
+/** Charge an MTN MoMo wallet (provider "mtn"). User approves via PIN push on their phone. */
 export async function chargeMobileMoney(
   amountPesewas: number,
   phone: string,
@@ -126,23 +106,12 @@ export async function chargeMobileMoney(
     reference,
     mobile_money: {
       phone,
-      provider: 'vod',
+      provider: 'mtn',
     },
   });
 }
 
-/** Submit voucher code (OTP) for a pending mobile money charge */
-export async function submitChargeOTP(
-  reference: string,
-  otp: string
-): Promise<PaystackCharge> {
-  return paystackRequest<PaystackCharge>('POST', '/charge/submit_otp', {
-    reference,
-    otp,
-  });
-}
-
-/** Check the status of a pending charge */
+/** Check the status of a pending charge (used while polling auto-fund). */
 export async function checkPendingCharge(reference: string): Promise<PaystackCharge> {
   return paystackRequest<PaystackCharge>('GET', `/charge/${reference}`);
 }
