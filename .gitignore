@@ -5,3 +5,5 @@ data/wa-auth/
 data/contacts.json
 .env
 *.log
+claude/
+CLAUDE.md
