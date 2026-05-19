@@ -10,10 +10,11 @@ export type CommandType =
 
 export interface ParsedCommand {
   type: CommandType;
-  amount?: number;       // in GHS (cedis), not pesewas
-  recipient?: string;    // nickname
-  confirmValue?: boolean; // true = yes, false = no
-  contactName?: string;  // for ADD_CONTACT
-  contactPhone?: string; // for ADD_CONTACT
-  raw: string;           // original message text
+  amount?: number;          // GHS (cedis), not pesewas
+  recipient?: string;       // contact nickname
+  recipientPhone?: string;  // raw Ghana phone number for ad-hoc sends
+  confirmValue?: boolean;
+  contactName?: string;     // for ADD_CONTACT
+  contactPhone?: string;    // for ADD_CONTACT
+  raw: string;
 }
