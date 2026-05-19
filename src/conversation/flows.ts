@@ -1,5 +1,5 @@
 import { ParsedCommand } from '../parser/types';
-import { resolveRecipient } from '../contacts/resolver';
+import { resolveRecipient, resolveAdhocPhone, ResolvedContact } from '../contacts/resolver';
 import { findContactByNickname, getAllContacts, addContact, updateRecipientCode } from '../contacts/store';
 import { validateAmount } from '../payment/validator';
 import { toPesewas, formatGHS } from '../utils/money';
@@ -9,31 +9,26 @@ import {
   getGHSBalance,
   createRecipient as createPaystackRecipient,
   initiateTransfer,
-  resolveTelecelCode,
+  resolveMtnCode,
   chargeMobileMoney,
-  submitChargeOTP,
   checkPendingCharge,
 } from '../payment/paystack';
 import {
   PendingTransfer,
   setAwaitingConfirmation,
-  setAwaitingVoucher,
   getPendingTransfer,
-  getPendingCharge,
   clearPending,
-  isAwaitingConfirmation,
 } from './state';
 import { getDb } from '../db/client';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 
-// Cache the Telecel bank code after resolving at startup
-let telecelBankCode: string | null = null;
+let mtnBankCode: string | null = null;
 
 export async function initPaymentProvider(): Promise<void> {
-  telecelBankCode = await resolveTelecelCode();
-  if (!telecelBankCode) {
-    logger.warn('Telecel bank code not found — transfers will fail until resolved');
+  mtnBankCode = await resolveMtnCode();
+  if (!mtnBankCode) {
+    logger.warn('MTN bank code not found — transfers will fail until resolved');
   }
 }
 
@@ -41,21 +36,24 @@ export async function handleSend(
   cmd: ParsedCommand,
   sendReply: (text: string) => Promise<void>
 ): Promise<void> {
-  if (!cmd.amount || !cmd.recipient) {
-    await sendReply('Could not parse amount or recipient. Try: *send 50 to Kojo*');
+  if (!cmd.amount || (!cmd.recipient && !cmd.recipientPhone)) {
+    await sendReply('Could not parse amount or recipient. Try: *send 50 to Kojo* or *send 30 to 0241234567*');
     return;
   }
 
-  // Resolve contact
-  const resolved = resolveRecipient(cmd.recipient);
-  if (!resolved) {
-    await sendReply(
-      `Contact "${cmd.recipient}" not found.\n\nAdd them with:\n*add contact ${cmd.recipient} 024XXXXXXX*`
-    );
-    return;
+  let resolved: ResolvedContact | null;
+  if (cmd.recipientPhone) {
+    resolved = resolveAdhocPhone(cmd.recipientPhone);
+  } else {
+    resolved = resolveRecipient(cmd.recipient!);
+    if (!resolved) {
+      await sendReply(
+        `Contact "${cmd.recipient}" not found.\n\nAdd them with:\n*add contact ${cmd.recipient} 024XXXXXXX*\n\nOr send directly: *send ${cmd.amount} to 024XXXXXXX*`
+      );
+      return;
+    }
   }
 
-  // Validate amount
   const validation = validateAmount(cmd.amount);
   if (!validation.ok) {
     await sendReply(validation.error!);
@@ -65,20 +63,18 @@ export async function handleSend(
   const amountPesewas = toPesewas(cmd.amount);
   const reference = generateReference();
 
-  // Store pending transaction in DB before confirmation
   const db = getDb();
   db.prepare(
     `INSERT INTO transactions (contact_id, amount_pesewas, status, paystack_reference, reason)
      VALUES (?, ?, 'pending', ?, ?)`
-  ).run(resolved.contact.id, amountPesewas, reference, `Send to ${resolved.displayName}`);
+  ).run(resolved.contact?.id ?? null, amountPesewas, reference, `Send to ${resolved.displayName}`);
 
-  // Set awaiting confirmation
   setAwaitingConfirmation(
     {
-      contactId: resolved.contact.id,
+      contactId: resolved.contact?.id ?? null,
       contactNickname: resolved.displayName,
-      phone: resolved.contact.phone,
-      recipientCode: resolved.contact.recipient_code,
+      phone: resolved.phone,
+      recipientCode: resolved.recipientCode,
       amountGHS: cmd.amount,
       amountPesewas,
       reference,
@@ -91,7 +87,7 @@ export async function handleSend(
 
   await sendReply(
     `*Confirm Transfer*\n\n` +
-    `To: ${resolved.displayName} (${toLocal(resolved.contact.phone)})\n` +
+    `To: ${resolved.displayName} (${toLocal(resolved.phone)})\n` +
     `Amount: ${formatGHS(amountPesewas)}\n\n` +
     `Reply *YES* to confirm or *NO* to cancel.`
   );
@@ -116,20 +112,17 @@ export async function handleConfirmation(
     return;
   }
 
-  // Execute the transfer
   try {
-    if (!telecelBankCode) {
-      throw new Error('Telecel bank code not resolved. Cannot process transfer.');
+    if (!mtnBankCode) {
+      throw new Error('MTN bank code not resolved. Cannot process transfer.');
     }
 
-    // Check balance — auto-fund if insufficient
     const balancePesewas = await getGHSBalance();
     if (balancePesewas < pending.amountPesewas) {
-      await startAutoFund(pending, balancePesewas, sendReply);
+      await fundAndTransfer(pending, balancePesewas, sendReply);
       return;
     }
 
-    // Balance sufficient — transfer directly
     await executeTransfer(pending, sendReply);
   } catch (err: any) {
     logger.error(err, 'Transfer failed');
@@ -138,79 +131,46 @@ export async function handleConfirmation(
   }
 }
 
-/** Initiate a mobile money charge to fund Paystack balance */
-async function startAutoFund(
+/** Top up Paystack from owner's MTN MoMo wallet, then execute the transfer. */
+async function fundAndTransfer(
   pending: PendingTransfer,
   currentBalancePesewas: number,
   sendReply: (text: string) => Promise<void>
 ): Promise<void> {
   const deficit = pending.amountPesewas - currentBalancePesewas;
-
-  await sendReply(
-    `Insufficient Paystack balance (${formatGHS(currentBalancePesewas)}).\n` +
-    `Charging ${formatGHS(deficit)} from your Telecel wallet...`
-  );
-
   const chargeRef = generateReference();
   const phone = toInternational(config.ownerPhone);
   const db = getDb();
 
-  // Store the charge reference on the transaction
   db.prepare(
     `UPDATE transactions SET charge_reference = ? WHERE paystack_reference = ?`
   ).run(chargeRef, pending.reference);
 
+  await sendReply(
+    `Insufficient Paystack balance (${formatGHS(currentBalancePesewas)}).\n` +
+    `Charging ${formatGHS(deficit)} from your MTN MoMo wallet.\n` +
+    `Approve the prompt on your phone (PIN).`
+  );
+
   try {
-    const charge = await chargeMobileMoney(
-      deficit,
-      phone,
-      config.ownerEmail,
-      chargeRef
-    );
+    const charge = await chargeMobileMoney(deficit, phone, config.ownerEmail, chargeRef);
 
-    if (charge.status === 'success') {
-      // Charge completed immediately (unlikely for Vodafone but handle it)
-      await sendReply('Wallet charged successfully.');
-      await executeTransfer(pending, sendReply);
-      return;
+    let status = charge.status;
+    if (status !== 'success') {
+      status = await pollCharge(chargeRef);
     }
 
-    if (charge.status === 'send_otp') {
-      // Vodafone flow: user needs to generate a voucher
-      const instruction = charge.display_text ||
-        'Dial *110# on your phone → My Wallet → Generate Voucher. Send the voucher code here.';
-
-      setAwaitingVoucher(
-        { chargeReference: chargeRef, transfer: pending },
-        async () => {
-          await sendReply('Voucher timed out — transfer cancelled.');
-          db.prepare("UPDATE transactions SET status = 'cancelled' WHERE paystack_reference = ?").run(pending.reference);
-        }
+    if (status !== 'success') {
+      db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(pending.reference);
+      await sendReply(
+        `Wallet charge did not complete (${status}). Transfer cancelled.\n` +
+        `If you approved the prompt, check your MoMo balance and try again.`
       );
-
-      await sendReply(instruction);
       return;
     }
 
-    if (charge.status === 'pay_offline') {
-      // MTN-style flow: user approves on phone, we poll
-      const instruction = charge.display_text ||
-        'Approve the payment prompt on your phone.';
-
-      setAwaitingVoucher(
-        { chargeReference: chargeRef, transfer: pending },
-        async () => {
-          await sendReply('Payment approval timed out — transfer cancelled.');
-          db.prepare("UPDATE transactions SET status = 'cancelled' WHERE paystack_reference = ?").run(pending.reference);
-        }
-      );
-
-      await sendReply(instruction + '\n\nSend *done* once you have approved.');
-      return;
-    }
-
-    // Unexpected status
-    throw new Error(`Unexpected charge status: ${charge.status}`);
+    await sendReply('Wallet charged. Sending now...');
+    await executeTransfer(pending, sendReply);
   } catch (err: any) {
     logger.error(err, 'Auto-fund charge failed');
     db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(pending.reference);
@@ -218,92 +178,46 @@ async function startAutoFund(
   }
 }
 
-/** Handle voucher/OTP submission or "done" for pay_offline */
-export async function handleVoucher(
-  text: string,
-  sendReply: (text: string) => Promise<void>
-): Promise<void> {
-  const pendingCharge = getPendingCharge();
-  if (!pendingCharge) {
-    await sendReply('No pending charge to complete.');
-    return;
+/** Poll a pending mobile money charge until success/failure or timeout (~90s). */
+async function pollCharge(reference: string): Promise<string> {
+  const intervalMs = 5000;
+  const maxAttempts = 18;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, intervalMs));
+    try {
+      const charge = await checkPendingCharge(reference);
+      if (charge.status === 'success') return 'success';
+      if (charge.status === 'failed') return 'failed';
+    } catch (err) {
+      logger.warn({ err }, 'Charge poll attempt failed');
+    }
   }
-
-  const { chargeReference, transfer } = pendingCharge;
-  clearPending();
-  const db = getDb();
-
-  try {
-    await sendReply('Processing...');
-
-    const otp = text.trim();
-    let charge;
-
-    if (/^\d+$/.test(otp)) {
-      // Numeric input → submit as OTP/voucher
-      charge = await submitChargeOTP(chargeReference, otp);
-    } else {
-      // Non-numeric (e.g. "done") → check pending status
-      charge = await checkPendingCharge(chargeReference);
-    }
-
-    if (charge.status === 'success') {
-      await sendReply('Wallet charged successfully.');
-      await executeTransfer(transfer, sendReply);
-      return;
-    }
-
-    if (charge.status === 'pending') {
-      // Still pending — poll once more after a short delay
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      charge = await checkPendingCharge(chargeReference);
-
-      if (charge.status === 'success') {
-        await sendReply('Wallet charged successfully.');
-        await executeTransfer(transfer, sendReply);
-        return;
-      }
-
-      db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(transfer.reference);
-      await sendReply(`Charge still pending. Please try the transfer again.\nRef: ${chargeReference}`);
-      return;
-    }
-
-    // Failed or unexpected
-    db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(transfer.reference);
-    await sendReply(`Charge failed (${charge.status}). Transfer cancelled.`);
-  } catch (err: any) {
-    logger.error(err, 'Voucher submission failed');
-    db.prepare("UPDATE transactions SET status = 'failed' WHERE paystack_reference = ?").run(transfer.reference);
-    await sendReply(`Charge failed: ${err.message}`);
-  }
+  return 'timeout';
 }
 
-/** Execute the actual Paystack transfer (shared by direct and auto-funded paths) */
 async function executeTransfer(
   pending: PendingTransfer,
   sendReply: (text: string) => Promise<void>
 ): Promise<void> {
   const db = getDb();
 
-  if (!telecelBankCode) {
-    throw new Error('Telecel bank code not resolved. Cannot process transfer.');
+  if (!mtnBankCode) {
+    throw new Error('MTN bank code not resolved. Cannot process transfer.');
   }
 
-  // Create Paystack recipient if not yet created
   let recipientCode = pending.recipientCode;
   if (!recipientCode) {
-    await sendReply('Setting up recipient...');
     const recipient = await createPaystackRecipient(
       pending.contactNickname,
       pending.phone,
-      telecelBankCode
+      mtnBankCode
     );
     recipientCode = recipient.recipient_code;
-    updateRecipientCode(pending.contactId, recipientCode);
+    if (pending.contactId !== null) {
+      updateRecipientCode(pending.contactId, recipientCode);
+    }
   }
 
-  // Initiate transfer
   const transfer = await initiateTransfer(
     recipientCode,
     pending.amountPesewas,
@@ -311,21 +225,19 @@ async function executeTransfer(
     pending.reference
   );
 
-  // Update transaction record
   db.prepare(
     `UPDATE transactions SET status = ?, paystack_transfer_code = ? WHERE paystack_reference = ?`
   ).run(transfer.status, transfer.transfer_code, pending.reference);
 
-  const statusEmoji = transfer.status === 'success' ? 'sent' : 'processing';
+  const statusLabel = transfer.status === 'success' ? 'sent' : 'processing';
   await sendReply(
-    `Transfer ${statusEmoji}!\n\n` +
+    `Transfer ${statusLabel}!\n\n` +
     `To: ${pending.contactNickname}\n` +
     `Amount: ${formatGHS(pending.amountPesewas)}\n` +
     `Status: ${transfer.status}\n` +
     `Ref: ${pending.reference}`
   );
 
-  // Low balance alert
   const newBalance = await getGHSBalance();
   if (newBalance < toPesewas(config.lowBalanceAlertGHS)) {
     await sendReply(`Low balance alert: ${formatGHS(newBalance)} remaining.`);
@@ -348,11 +260,11 @@ export async function handleHistory(sendReply: (text: string) => Promise<void>):
     .prepare(
       `SELECT t.amount_pesewas, t.status, t.created_at, c.nickname
        FROM transactions t
-       JOIN contacts c ON c.id = t.contact_id
+       LEFT JOIN contacts c ON c.id = t.contact_id
        ORDER BY t.created_at DESC
        LIMIT 10`
     )
-    .all() as Array<{ amount_pesewas: number; status: string; created_at: string; nickname: string }>;
+    .all() as Array<{ amount_pesewas: number; status: string; created_at: string; nickname: string | null }>;
 
   if (rows.length === 0) {
     await sendReply('No transactions yet.');
@@ -360,7 +272,7 @@ export async function handleHistory(sendReply: (text: string) => Promise<void>):
   }
 
   const lines = rows.map(
-    (r, i) => `${i + 1}. ${formatGHS(r.amount_pesewas)} to ${r.nickname} — ${r.status} (${r.created_at})`
+    (r, i) => `${i + 1}. ${formatGHS(r.amount_pesewas)} to ${r.nickname ?? 'ad-hoc'} — ${r.status} (${r.created_at})`
   );
   await sendReply(`*Last ${rows.length} Transactions*\n\n${lines.join('\n')}`);
 }
@@ -398,8 +310,9 @@ export async function handleAddContact(
 export async function handleHelp(sendReply: (text: string) => Promise<void>): Promise<void> {
   await sendReply(
     `*Easy-Send Commands*\n\n` +
-    `*send 50 to Kojo* — Send money\n` +
-    `*send 20 cedis to Ama* — Send with currency\n` +
+    `*send 50 to Kojo* — Send to a saved contact\n` +
+    `*send fifty cedis paul* — Words work too\n` +
+    `*send 30 to 0241234567* — Send to any MTN number\n` +
     `*bal* — Check Paystack balance\n` +
     `*history* — Recent transactions\n` +
     `*contacts* — List contacts\n` +
