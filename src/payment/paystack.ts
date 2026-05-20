@@ -1,6 +1,14 @@
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { PaystackBalance, PaystackBank, PaystackCharge, PaystackRecipient, PaystackTransfer } from './types';
+import {
+  PaystackAccountResolution,
+  PaystackBalance,
+  PaystackBank,
+  PaystackCharge,
+  PaystackRecipient,
+  PaystackTransfer,
+} from './types';
+import { Network } from '../utils/phone';
 import crypto from 'crypto';
 
 const BASE_URL = 'https://api.paystack.co';
@@ -8,7 +16,8 @@ const BASE_URL = 'https://api.paystack.co';
 async function paystackRequest<T>(
   method: string,
   path: string,
-  body?: Record<string, unknown>
+  body?: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<T> {
   const url = `${BASE_URL}${path}`;
   const options: RequestInit = {
@@ -21,6 +30,10 @@ async function paystackRequest<T>(
 
   if (body) {
     options.body = JSON.stringify(body);
+  }
+
+  if (signal) {
+    options.signal = signal;
   }
 
   const res = await fetch(url, options);
@@ -47,18 +60,30 @@ export async function getGHSBalance(): Promise<number> {
   return ghs?.balance ?? 0;
 }
 
-/** Find the MTN Mobile Money provider code dynamically */
-export async function resolveMtnCode(): Promise<string | null> {
-  const banks = await paystackRequest<PaystackBank[]>('GET', '/bank?currency=GHS&type=mobile_money');
-  const mtn = banks.find(b => b.name.toLowerCase().includes('mtn'));
+/** Name fragments that identify each network in Paystack's bank list. */
+const NETWORK_BANK_ALIASES: Record<Network, string[]> = {
+  mtn: ['mtn'],
+  telecel: ['telecel', 'vodafone'],
+  airteltigo: ['airteltigo', 'airtel', 'tigo'],
+};
 
-  if (mtn) {
-    logger.info('Resolved MTN provider code: %s (%s)', mtn.code, mtn.name);
-    return mtn.code;
+/** Resolve every Ghana mobile-money network's Paystack bank code. */
+export async function resolveMomoBankCodes(): Promise<Record<Network, string | null>> {
+  const banks = await paystackRequest<PaystackBank[]>('GET', '/bank?currency=GHS&type=mobile_money');
+  const result: Record<Network, string | null> = { mtn: null, telecel: null, airteltigo: null };
+
+  for (const network of Object.keys(NETWORK_BANK_ALIASES) as Network[]) {
+    const aliases = NETWORK_BANK_ALIASES[network];
+    const match = banks.find(b => aliases.some(a => b.name.toLowerCase().includes(a)));
+    if (match) {
+      result[network] = match.code;
+      logger.info('Resolved %s provider code: %s (%s)', network, match.code, match.name);
+    } else {
+      logger.warn('Could not find %s in Paystack mobile money banks', network);
+    }
   }
 
-  logger.error('Could not find MTN in Paystack banks: %o', banks.map(b => b.name));
-  return null;
+  return result;
 }
 
 /** Create a transfer recipient (one-time per contact) */
@@ -114,4 +139,28 @@ export async function chargeMobileMoney(
 /** Check the status of a pending charge (used while polling auto-fund). */
 export async function checkPendingCharge(reference: string): Promise<PaystackCharge> {
   return paystackRequest<PaystackCharge>('GET', `/charge/${reference}`);
+}
+
+/**
+ * Look up the registered account name for a mobile money number.
+ * Returns null on any failure (unregistered number, network error, timeout) —
+ * callers treat a null as "name unavailable" and warn rather than block.
+ */
+export async function resolveAccountName(phone: string, bankCode: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  try {
+    const data = await paystackRequest<PaystackAccountResolution>(
+      'GET',
+      `/bank/resolve?account_number=${encodeURIComponent(phone)}&bank_code=${encodeURIComponent(bankCode)}`,
+      undefined,
+      controller.signal
+    );
+    return data.account_name;
+  } catch (err) {
+    logger.warn({ err }, 'Account name resolution failed');
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
