@@ -7,3 +7,4 @@ data/contacts.json
 *.log
 .claude/
 CLAUDE.md
+docs/
