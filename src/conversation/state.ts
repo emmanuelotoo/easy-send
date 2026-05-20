@@ -1,10 +1,12 @@
 import { config } from '../config';
+import { Network } from '../utils/phone';
 
 export interface PendingTransfer {
   /** Contact id, or null for ad-hoc raw-phone sends */
   contactId: number | null;
   contactNickname: string;
   phone: string;
+  network: Network;
   recipientCode: string | null;
   amountGHS: number;
   amountPesewas: number;
