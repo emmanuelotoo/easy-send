@@ -32,3 +32,8 @@ export interface PaystackCharge {
   reference: string;
   status: string; // "pay_offline", "pending", "success", "failed"
 }
+
+export interface PaystackAccountResolution {
+  account_number: string;
+  account_name: string;
+}
