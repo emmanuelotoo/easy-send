@@ -1,10 +1,10 @@
 # Easy-Send
 
-Personal WhatsApp chatbot that sends MTN MoMo (Ghana) payments via natural-language commands. Single user, runs locally.
+Personal WhatsApp chatbot that sends Ghana mobile money (MTN, Telecel, AirtelTigo) payments via natural-language commands. Single user, runs locally.
 
 ## How it works
 
-You message your own WhatsApp number; the bot parses commands like `send 50 to Kojo` or `send 20 to 0241234567`, asks for confirmation, then dispatches the transfer via Paystack. Funds come from your MTN MoMo wallet (auto-charged when the Paystack balance is low).
+You message your own WhatsApp number; the bot parses commands like `send 50 to Kojo` or `send 20 to 0241234567`, looks up the recipient's registered name, and asks you to confirm before dispatching the transfer via Paystack. Recipients can be on MTN, Telecel, or AirtelTigo — the network is detected automatically from the number. Funds come from your MTN MoMo wallet (auto-charged when the Paystack balance is low).
 
 ## Setup
 
@@ -32,6 +32,8 @@ The session persists in `data/wa-auth/`, so the QR is one-time.
 | `help` | Show help |
 
 Amounts accept word-numbers (`fifty`) and optional currency words (`cedis`, `ghs`).
+
+Before sending, the bot replies with a confirmation showing the recipient's Paystack-registered name and network — a guard against wrong numbers. If the name can't be verified it warns you but still lets you continue.
 
 ## Scripts
 
