@@ -3,16 +3,18 @@ import { resolveRecipient, resolveAdhocPhone, ResolvedContact } from '../contact
 import { findContactByNickname, getAllContacts, addContact, updateRecipientCode } from '../contacts/store';
 import { validateAmount } from '../payment/validator';
 import { toPesewas, formatGHS } from '../utils/money';
-import { toLocal, toInternational } from '../utils/phone';
+import { toLocal, toInternational, detectNetwork, networkLabel, Network } from '../utils/phone';
 import {
   generateReference,
   getGHSBalance,
   createRecipient as createPaystackRecipient,
   initiateTransfer,
-  resolveMtnCode,
+  resolveMomoBankCodes,
+  resolveAccountName,
   chargeMobileMoney,
   checkPendingCharge,
 } from '../payment/paystack';
+import { computeChargeAmount } from '../payment/fees';
 import {
   PendingTransfer,
   setAwaitingConfirmation,
@@ -23,12 +25,14 @@ import { getDb } from '../db/client';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 
-let mtnBankCode: string | null = null;
+let bankCodes: Record<Network, string | null> = { mtn: null, telecel: null, airteltigo: null };
 
 export async function initPaymentProvider(): Promise<void> {
-  mtnBankCode = await resolveMtnCode();
-  if (!mtnBankCode) {
-    logger.warn('MTN bank code not found — transfers will fail until resolved');
+  bankCodes = await resolveMomoBankCodes();
+  for (const network of Object.keys(bankCodes) as Network[]) {
+    if (!bankCodes[network]) {
+      logger.warn('%s bank code not found — transfers to %s will fail until resolved', network, network);
+    }
   }
 }
 
@@ -60,8 +64,24 @@ export async function handleSend(
     return;
   }
 
+  const network = detectNetwork(resolved.phone);
+  if (!network) {
+    await sendReply(
+      `Couldn't recognize the network for that number.\nEasy-Send supports MTN, Telecel, and AirtelTigo numbers.`
+    );
+    return;
+  }
+
+  const bankCode = bankCodes[network];
+  if (!bankCode) {
+    await sendReply(`Sending to ${networkLabel(network)} isn't available right now. Please try again later.`);
+    return;
+  }
+
   const amountPesewas = toPesewas(cmd.amount);
   const reference = generateReference();
+
+  const verifiedName = await resolveAccountName(resolved.phone, bankCode);
 
   const db = getDb();
   db.prepare(
@@ -74,6 +94,7 @@ export async function handleSend(
       contactId: resolved.contact?.id ?? null,
       contactNickname: resolved.displayName,
       phone: resolved.phone,
+      network,
       recipientCode: resolved.recipientCode,
       amountGHS: cmd.amount,
       amountPesewas,
@@ -85,10 +106,25 @@ export async function handleSend(
     }
   );
 
+  const label = networkLabel(network);
+  const localPhone = toLocal(resolved.phone);
+  let toLine: string;
+  let warning = '';
+  if (verifiedName) {
+    toLine = resolved.contact
+      ? `To: ${resolved.displayName} — verified: ${verifiedName} (${localPhone} · ${label})`
+      : `To: ${verifiedName} (${localPhone} · ${label})`;
+  } else {
+    toLine = resolved.contact
+      ? `To: ${resolved.displayName} (${localPhone} · ${label})`
+      : `To: ${localPhone} · ${label}`;
+    warning = `\n⚠️ Couldn't verify the recipient's name — double-check the number.`;
+  }
+
   await sendReply(
     `*Confirm Transfer*\n\n` +
-    `To: ${resolved.displayName} (${toLocal(resolved.phone)})\n` +
-    `Amount: ${formatGHS(amountPesewas)}\n\n` +
+    `${toLine}\n` +
+    `Amount: ${formatGHS(amountPesewas)}${warning}\n\n` +
     `Reply *YES* to confirm or *NO* to cancel.`
   );
 }
@@ -113,10 +149,6 @@ export async function handleConfirmation(
   }
 
   try {
-    if (!mtnBankCode) {
-      throw new Error('MTN bank code not resolved. Cannot process transfer.');
-    }
-
     const balancePesewas = await getGHSBalance();
     if (balancePesewas < pending.amountPesewas) {
       await fundAndTransfer(pending, balancePesewas, sendReply);
@@ -138,6 +170,7 @@ async function fundAndTransfer(
   sendReply: (text: string) => Promise<void>
 ): Promise<void> {
   const deficit = pending.amountPesewas - currentBalancePesewas;
+  const chargeAmount = computeChargeAmount(deficit);
   const chargeRef = generateReference();
   const phone = toInternational(config.ownerPhone);
   const db = getDb();
@@ -148,12 +181,12 @@ async function fundAndTransfer(
 
   await sendReply(
     `Insufficient Paystack balance (${formatGHS(currentBalancePesewas)}).\n` +
-    `Charging ${formatGHS(deficit)} from your MTN MoMo wallet.\n` +
+    `Charging ${formatGHS(chargeAmount)} from your MTN MoMo wallet.\n` +
     `Approve the prompt on your phone (PIN).`
   );
 
   try {
-    const charge = await chargeMobileMoney(deficit, phone, config.ownerEmail, chargeRef);
+    const charge = await chargeMobileMoney(chargeAmount, phone, config.ownerEmail, chargeRef);
 
     let status = charge.status;
     if (status !== 'success') {
@@ -201,8 +234,9 @@ async function executeTransfer(
 ): Promise<void> {
   const db = getDb();
 
-  if (!mtnBankCode) {
-    throw new Error('MTN bank code not resolved. Cannot process transfer.');
+  const bankCode = bankCodes[pending.network];
+  if (!bankCode) {
+    throw new Error(`${networkLabel(pending.network)} bank code not resolved. Cannot process transfer.`);
   }
 
   let recipientCode = pending.recipientCode;
@@ -210,7 +244,7 @@ async function executeTransfer(
     const recipient = await createPaystackRecipient(
       pending.contactNickname,
       pending.phone,
-      mtnBankCode
+      bankCode
     );
     recipientCode = recipient.recipient_code;
     if (pending.contactId !== null) {
@@ -312,7 +346,7 @@ export async function handleHelp(sendReply: (text: string) => Promise<void>): Pr
     `*Easy-Send Commands*\n\n` +
     `*send 50 to Kojo* — Send to a saved contact\n` +
     `*send fifty cedis paul* — Words work too\n` +
-    `*send 30 to 0241234567* — Send to any MTN number\n` +
+    `*send 30 to 0241234567* — Send to any MoMo number\n` +
     `*bal* — Check Paystack balance\n` +
     `*history* — Recent transactions\n` +
     `*contacts* — List contacts\n` +
