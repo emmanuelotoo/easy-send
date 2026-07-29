@@ -36,14 +36,19 @@ export function validateAmount(amountGHS: number): ValidationResult {
   return { ok: true };
 }
 
-/** Get total amount sent today in pesewas */
+/**
+ * Get total amount sent today in pesewas.
+ * Counts every row that isn't cancelled or failed: Paystack often returns
+ * 'pending' for an initiated transfer and nothing reconciles it to 'success'
+ * later, so money that has left the balance must still count against the limit.
+ */
 function getTodaySpendingPesewas(): number {
   const db = getDb();
   const row = db
     .prepare(
       `SELECT COALESCE(SUM(amount_pesewas), 0) as total
        FROM transactions
-       WHERE status = 'success'
+       WHERE status NOT IN ('cancelled', 'failed')
          AND date(created_at) = date('now')`
     )
     .get() as { total: number };

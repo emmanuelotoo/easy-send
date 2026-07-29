@@ -55,6 +55,23 @@ export function runMigrations(): void {
   }
 }
 
+/**
+ * Cancel 'pending' rows left behind by a crash or restart while a transfer
+ * was awaiting confirmation. Rows with a transfer code are real initiated
+ * transfers and are left alone.
+ */
+export function cancelStaleTransactions(): void {
+  const database = getDb();
+  const info = database
+    .prepare(
+      "UPDATE transactions SET status = 'cancelled' WHERE status = 'pending' AND paystack_transfer_code IS NULL"
+    )
+    .run();
+  if (info.changes > 0) {
+    logger.info('Cancelled %d stale pending transaction(s) from a previous run', info.changes);
+  }
+}
+
 export function closeDb(): void {
   if (db) {
     db.close();

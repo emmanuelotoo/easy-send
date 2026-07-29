@@ -46,6 +46,12 @@ Before sending, the bot replies with a confirmation showing the recipient's Pays
 
 Node.js + TypeScript · Baileys (WhatsApp) · Paystack (payments) · better-sqlite3 (local state)
 
+## Costs
+
+- Paystack charges a flat **GHS 1 per mobile-money transfer**, deducted from your Paystack balance.
+- Auto-funding (charging your MoMo wallet when the balance is short) costs an extra **1.95%** — Paystack's collection fee.
+- **Cheapest way to run it:** top up your Paystack balance manually via the dashboard's Top-up feature (free for Ghana businesses) and keep a float. Then each send only costs the flat GHS 1. The confirmation message shows the exact cost, including any auto-fund premium, before you say YES.
+
 ## Notes
 
 - Limits: per-transaction and daily caps configured in `.env`

@@ -14,7 +14,7 @@ import {
   chargeMobileMoney,
   checkPendingCharge,
 } from '../payment/paystack';
-import { computeChargeAmount } from '../payment/fees';
+import { computeChargeAmount, TRANSFER_FEE_PESEWAS } from '../payment/fees';
 import {
   PendingTransfer,
   setAwaitingConfirmation,
@@ -106,6 +106,25 @@ export async function handleSend(
     }
   );
 
+  // Surface the true cost up front: the GHS 1 transfer fee always applies, and
+  // when the balance can't cover amount + fee, auto-fund adds Paystack's 1.95%
+  // collection cut — avoidable via a free top-up on the Paystack dashboard.
+  let fundingNote = '';
+  try {
+    const balance = await getGHSBalance();
+    const needed = amountPesewas + TRANSFER_FEE_PESEWAS;
+    if (balance < needed) {
+      const chargeAmount = computeChargeAmount(amountPesewas - balance);
+      const premium = chargeAmount - (needed - balance);
+      fundingNote =
+        `\nBalance is ${formatGHS(balance)}, so ~${formatGHS(chargeAmount)} will be auto-charged from your MoMo wallet ` +
+        `(≈${formatGHS(premium)} extra in fees).\n` +
+        `💡 Top up free on your Paystack dashboard first to skip that fee.`;
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Pre-confirmation balance check failed; continuing without funding note');
+  }
+
   const label = networkLabel(network);
   const localPhone = toLocal(resolved.phone);
   let toLine: string;
@@ -124,7 +143,8 @@ export async function handleSend(
   await sendReply(
     `*Confirm Transfer*\n\n` +
     `${toLine}\n` +
-    `Amount: ${formatGHS(amountPesewas)}${warning}\n\n` +
+    `Amount: ${formatGHS(amountPesewas)}\n` +
+    `Fee: ${formatGHS(TRANSFER_FEE_PESEWAS)}${warning}${fundingNote}\n\n` +
     `Reply *YES* to confirm or *NO* to cancel.`
   );
 }
@@ -150,7 +170,9 @@ export async function handleConfirmation(
 
   try {
     const balancePesewas = await getGHSBalance();
-    if (balancePesewas < pending.amountPesewas) {
+    // Paystack deducts the GHS 1 transfer fee from the balance on top of the amount,
+    // so the balance must cover both or the transfer is rejected.
+    if (balancePesewas < pending.amountPesewas + TRANSFER_FEE_PESEWAS) {
       await fundAndTransfer(pending, balancePesewas, sendReply);
       return;
     }
@@ -274,7 +296,10 @@ async function executeTransfer(
 
   const newBalance = await getGHSBalance();
   if (newBalance < toPesewas(config.lowBalanceAlertGHS)) {
-    await sendReply(`Low balance alert: ${formatGHS(newBalance)} remaining.`);
+    await sendReply(
+      `Low balance alert: ${formatGHS(newBalance)} remaining.\n` +
+      `💡 Top up free on your Paystack dashboard — auto-funding from your wallet costs 1.95% extra.`
+    );
   }
 }
 

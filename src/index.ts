@@ -1,5 +1,5 @@
 import { validateConfig } from './config';
-import { runMigrations, closeDb } from './db/client';
+import { runMigrations, cancelStaleTransactions, closeDb } from './db/client';
 import { seedContacts } from './contacts/store';
 import { startWhatsapp, stopWhatsapp } from './whatsapp/connection';
 import { initPaymentProvider } from './conversation/flows';
@@ -12,6 +12,7 @@ async function main() {
 
   validateConfig();
   runMigrations();
+  cancelStaleTransactions();
 
   const contactsFile = path.join(process.cwd(), 'data', 'contacts.json');
   if (fs.existsSync(contactsFile)) {
