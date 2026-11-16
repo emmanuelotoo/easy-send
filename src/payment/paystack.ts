@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import {
@@ -9,53 +10,73 @@ import {
   PaystackTransfer,
 } from './types';
 import { Network } from '../utils/phone';
-import crypto from 'crypto';
 
-const BASE_URL = 'https://api.paystack.co';
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Paystack answered and said no. The request definitely did not go through,
+ * so it is safe to report the failure to the user.
+ */
+export class PaystackApiError extends Error {
+  constructor(message: string, readonly httpStatus: number) {
+    super(message);
+    this.name = 'PaystackApiError';
+  }
+}
+
+/**
+ * We could not get a usable answer (timeout, dropped connection, 5xx).
+ * The outcome is UNKNOWN: for a transfer, money may or may not have moved,
+ * so callers must verify by reference instead of assuming failure.
+ */
+export class PaystackNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PaystackNetworkError';
+  }
+}
 
 async function paystackRequest<T>(
   method: string,
   path: string,
   body?: Record<string, unknown>,
-  signal?: AbortSignal
+  timeoutMs = DEFAULT_TIMEOUT_MS
 ): Promise<T> {
-  const url = `${BASE_URL}${path}`;
-  const options: RequestInit = {
-    method,
-    headers: {
-      Authorization: `Bearer ${config.paystackSecretKey}`,
-      'Content-Type': 'application/json',
-    },
-  };
-
-  if (body) {
-    options.body = JSON.stringify(body);
+  let res: Response;
+  try {
+    res = await fetch(`${config.paystackBaseUrl}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${config.paystackSecretKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err: any) {
+    throw new PaystackNetworkError(`Could not reach Paystack (${err?.name ?? 'error'})`);
   }
 
-  if (signal) {
-    options.signal = signal;
+  type Envelope = { status?: boolean; message?: string; data?: T };
+  const json = (await res.json().catch(() => null)) as Envelope | null;
+
+  if (res.status >= 500 || json === null || typeof json !== 'object') {
+    throw new PaystackNetworkError(`Paystack is unavailable (HTTP ${res.status})`);
   }
-
-  const res = await fetch(url, options);
-  const json = await res.json() as { status: boolean; message: string; data: T };
-
-  if (!json.status) {
-    throw new Error(`Paystack error: ${json.message}`);
+  if (!res.ok || !json.status) {
+    throw new PaystackApiError(json.message || `Paystack rejected the request (HTTP ${res.status})`, res.status);
   }
-
-  return json.data;
+  return json.data as T;
 }
 
-/** Generate a unique idempotency reference */
+/** Unique reference for a transfer or charge. Doubles as Paystack's idempotency key. */
 export function generateReference(): string {
-  const timestamp = Date.now();
-  const random = crypto.randomBytes(4).toString('hex');
-  return `easysend_${timestamp}_${random}`;
+  return `easysend_${Date.now().toString(36)}_${crypto.randomBytes(5).toString('hex')}`;
 }
 
-/** Get GHS balance in pesewas */
+/** GHS balance available for transfers, in pesewas. */
 export async function getGHSBalance(): Promise<number> {
-  const balances = await paystackRequest<PaystackBalance[]>('GET', '/balance');
+  const balances = await paystackRequest<PaystackBalance[]>('GET', '/balance', undefined, 15_000);
   const ghs = balances.find(b => b.currency === 'GHS');
   return ghs?.balance ?? 0;
 }
@@ -86,7 +107,7 @@ export async function resolveMomoBankCodes(): Promise<Record<Network, string | n
   return result;
 }
 
-/** Create a transfer recipient (one-time per contact) */
+/** Create a transfer recipient. */
 export async function createRecipient(
   name: string,
   phone: string,
@@ -101,7 +122,7 @@ export async function createRecipient(
   });
 }
 
-/** Initiate a transfer from Paystack balance to a recipient */
+/** Initiate a transfer from the Paystack balance to a recipient. */
 export async function initiateTransfer(
   recipientCode: string,
   amountPesewas: number,
@@ -117,10 +138,41 @@ export async function initiateTransfer(
   });
 }
 
-/** Charge an MTN MoMo wallet (provider "mtn"). User approves via PIN push on their phone. */
+/** Look a transfer up by our reference. Returns null when Paystack has no such transfer. */
+export async function verifyTransfer(reference: string): Promise<PaystackTransfer | null> {
+  try {
+    return await paystackRequest<PaystackTransfer>(
+      'GET',
+      `/transfer/verify/${encodeURIComponent(reference)}`
+    );
+  } catch (err) {
+    if (err instanceof PaystackApiError && (err.httpStatus === 404 || err.httpStatus === 400)) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+/** Complete a transfer that Paystack parked behind an OTP. */
+export async function finalizeTransfer(transferCode: string, otp: string): Promise<PaystackTransfer> {
+  return paystackRequest<PaystackTransfer>('POST', '/transfer/finalize_transfer', {
+    transfer_code: transferCode,
+    otp,
+  });
+}
+
+/** Paystack's provider codes for charging a Ghana mobile money wallet. */
+const CHARGE_PROVIDER: Record<Network, string> = {
+  mtn: 'mtn',
+  telecel: 'vod',
+  airteltigo: 'atl',
+};
+
+/** Charge a mobile money wallet. The owner approves it on their phone. */
 export async function chargeMobileMoney(
   amountPesewas: number,
   phone: string,
+  network: Network,
   email: string,
   reference: string
 ): Promise<PaystackCharge> {
@@ -131,36 +183,53 @@ export async function chargeMobileMoney(
     reference,
     mobile_money: {
       phone,
-      provider: 'mtn',
+      provider: CHARGE_PROVIDER[network],
     },
   });
 }
 
-/** Check the status of a pending charge (used while polling auto-fund). */
-export async function checkPendingCharge(reference: string): Promise<PaystackCharge> {
-  return paystackRequest<PaystackCharge>('GET', `/charge/${reference}`);
+/** Submit the OTP Paystack asked for while charging a wallet. */
+export async function submitChargeOtp(otp: string, reference: string): Promise<PaystackCharge> {
+  return paystackRequest<PaystackCharge>('POST', '/charge/submit_otp', { otp, reference });
+}
+
+/** Current state of a wallet charge. Returns null when Paystack has no such charge. */
+export async function checkPendingCharge(reference: string): Promise<PaystackCharge | null> {
+  try {
+    return await paystackRequest<PaystackCharge>('GET', `/charge/${encodeURIComponent(reference)}`);
+  } catch (err) {
+    if (err instanceof PaystackApiError && (err.httpStatus === 404 || err.httpStatus === 400)) {
+      return null;
+    }
+    throw err;
+  }
 }
 
 /**
  * Look up the registered account name for a mobile money number.
- * Returns null on any failure (unregistered number, network error, timeout) —
- * callers treat a null as "name unavailable" and warn rather than block.
+ * Returns null on any failure (unregistered number, network error, timeout):
+ * callers treat null as "name unavailable" and warn rather than block.
  */
 export async function resolveAccountName(phone: string, bankCode: string): Promise<string | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
   try {
     const data = await paystackRequest<PaystackAccountResolution>(
       'GET',
       `/bank/resolve?account_number=${encodeURIComponent(phone)}&bank_code=${encodeURIComponent(bankCode)}`,
       undefined,
-      controller.signal
+      8000
     );
-    return data.account_name;
-  } catch (err) {
-    logger.warn({ err }, 'Account name resolution failed');
+    return data.account_name || null;
+  } catch (err: any) {
+    logger.warn('Account name resolution failed: %s', err?.message);
     return null;
-  } finally {
-    clearTimeout(timeout);
   }
+}
+
+/** Paystack signs webhook bodies with HMAC-SHA512 keyed by the secret key. */
+export function isValidWebhookSignature(rawBody: string, signature: string | undefined): boolean {
+  if (!signature) return false;
+  const expected = crypto.createHmac('sha512', config.paystackSecretKey).update(rawBody).digest('hex');
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signature);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }

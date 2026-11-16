@@ -1,8 +1,7 @@
 node_modules/
 dist/
-data/*.db
-data/wa-auth/
-data/contacts.json
+data/*
+!data/contacts.example.json
 .env
 *.log
 .claude/

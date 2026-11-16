@@ -1,5 +1,5 @@
 import { config } from '../config';
-import { toPesewas } from '../utils/money';
+import { toPesewas, formatGHS } from '../utils/money';
 import { getDb } from '../db/client';
 
 export interface ValidationResult {
@@ -7,50 +7,47 @@ export interface ValidationResult {
   error?: string;
 }
 
-/** Validate a transfer amount against limits */
-export function validateAmount(amountGHS: number): ValidationResult {
-  if (amountGHS <= 0) {
-    return { ok: false, error: 'Amount must be greater than zero.' };
+/** Statuses where no money left (or will leave) the balance. */
+const NOT_SPENT = ['quoted', 'cancelled', 'expired', 'failed', 'reversed'];
+
+/**
+ * Total committed today in pesewas (UTC day, which is Ghana's local day).
+ * Counts every confirmed send that hasn't definitively failed, because an
+ * in-flight transfer has already left the balance.
+ */
+export function getTodaySpendingPesewas(excludeTransactionId?: number): number {
+  const row = getDb()
+    .prepare(
+      `SELECT COALESCE(SUM(amount_pesewas), 0) AS total
+         FROM transactions
+        WHERE status NOT IN (${NOT_SPENT.map(() => '?').join(',')})
+          AND date(created_at) = date('now')
+          AND id != ?`
+    )
+    .get(...NOT_SPENT, excludeTransactionId ?? -1) as { total: number };
+  return row.total;
+}
+
+/** Validate a transfer amount against the configured limits. */
+export function validateAmount(amountPesewas: number, excludeTransactionId?: number): ValidationResult {
+  if (!Number.isSafeInteger(amountPesewas) || amountPesewas <= 0) {
+    return { ok: false, error: 'Enter an amount greater than zero.' };
   }
 
-  if (amountGHS > config.perTransactionLimitGHS) {
-    return {
-      ok: false,
-      error: `Amount exceeds per-transaction limit of GHS ${config.perTransactionLimitGHS}.`,
-    };
+  const perTx = toPesewas(config.perTransactionLimitGHS);
+  if (amountPesewas > perTx) {
+    return { ok: false, error: `That is over your per-send limit of ${formatGHS(perTx)}.` };
   }
 
-  // Check daily spending
-  const todaySpent = getTodaySpendingPesewas();
-  const newTotal = todaySpent + toPesewas(amountGHS);
-  const dailyLimitPesewas = toPesewas(config.dailyLimitGHS);
-
-  if (newTotal > dailyLimitPesewas) {
-    const remaining = (dailyLimitPesewas - todaySpent) / 100;
+  const daily = toPesewas(config.dailyLimitGHS);
+  const spent = getTodaySpendingPesewas(excludeTransactionId);
+  if (spent + amountPesewas > daily) {
+    const remaining = Math.max(0, daily - spent);
     return {
       ok: false,
-      error: `Daily limit of GHS ${config.dailyLimitGHS} would be exceeded. Remaining today: GHS ${remaining.toFixed(2)}.`,
+      error: `That would pass your daily limit of ${formatGHS(daily)}. You can still send ${formatGHS(remaining)} today.`,
     };
   }
 
   return { ok: true };
-}
-
-/**
- * Get total amount sent today in pesewas.
- * Counts every row that isn't cancelled or failed: Paystack often returns
- * 'pending' for an initiated transfer and nothing reconciles it to 'success'
- * later, so money that has left the balance must still count against the limit.
- */
-function getTodaySpendingPesewas(): number {
-  const db = getDb();
-  const row = db
-    .prepare(
-      `SELECT COALESCE(SUM(amount_pesewas), 0) as total
-       FROM transactions
-       WHERE status NOT IN ('cancelled', 'failed')
-         AND date(created_at) = date('now')`
-    )
-    .get() as { total: number };
-  return row.total;
 }

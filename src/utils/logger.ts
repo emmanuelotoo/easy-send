@@ -1,10 +1,4 @@
 import pino from 'pino';
 import { config } from '../config';
 
-export const logger = pino({
-  level: config.logLevel,
-  transport: {
-    target: 'pino/file',
-    options: { destination: 1 }, // stdout
-  },
-});
+export const logger = pino({ level: config.logLevel });

@@ -13,8 +13,12 @@ export interface PaystackTransfer {
   reference: string;
   transfer_code: string;
   amount: number; // pesewas
-  status: string; // "success", "pending", "failed", "reversed"
+  /** "otp", "pending", "received", "success", "failed", "reversed", "abandoned", "rejected", "blocked" */
+  status: string;
   reason: string;
+  /** Present on some failures. */
+  gateway_response?: string | null;
+  failures?: unknown;
 }
 
 export interface PaystackBalance {
@@ -30,7 +34,12 @@ export interface PaystackBank {
 
 export interface PaystackCharge {
   reference: string;
-  status: string; // "pay_offline", "pending", "success", "failed"
+  /** "send_otp", "pay_offline", "pending", "success", "failed" */
+  status: string;
+  /** Instruction for the payer, e.g. "Please enter the OTP sent to your phone". */
+  display_text?: string | null;
+  gateway_response?: string | null;
+  message?: string | null;
 }
 
 export interface PaystackAccountResolution {
