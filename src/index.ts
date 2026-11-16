@@ -1,48 +1,58 @@
-import { validateConfig } from './config';
-import { runMigrations, cancelStaleTransactions, closeDb } from './db/client';
-import { seedContacts } from './contacts/store';
-import { startWhatsapp, stopWhatsapp } from './whatsapp/connection';
-import { initPaymentProvider } from './conversation/flows';
-import { logger } from './utils/logger';
 import fs from 'fs';
 import path from 'path';
+import { config, isSecureOrigin, rpId, validateConfig } from './config';
+import { enrollmentOpen, passkeyCount } from './auth/passkeys';
+import { seedContacts } from './contacts/store';
+import { closeDb, runMigrations } from './db/client';
+import { buildServer } from './http/server';
+import { initPaymentProvider, startReconciler, stopReconciler } from './transfers/service';
+import { logger } from './utils/logger';
 
 async function main() {
   logger.info('Starting Easy-Send...');
 
   validateConfig();
   runMigrations();
-  cancelStaleTransactions();
 
-  const contactsFile = path.join(process.cwd(), 'data', 'contacts.json');
+  const contactsFile = path.join(config.dataDir, 'contacts.json');
   if (fs.existsSync(contactsFile)) {
     const contacts = JSON.parse(fs.readFileSync(contactsFile, 'utf-8'));
     seedContacts(contacts);
     logger.info('Contacts seeded: %d entries', contacts.length);
   }
 
-  await initPaymentProvider();
-  await startWhatsapp();
+  try {
+    await initPaymentProvider();
+  } catch (err: any) {
+    // Not fatal: the networks are looked up again on the first send.
+    logger.warn('Paystack is not reachable yet: %s', err?.message);
+  }
 
-  logger.info('Easy-Send is running. Waiting for WhatsApp messages...');
+  if (passkeyCount() === 0 && !enrollmentOpen()) {
+    throw new Error('No passkey exists and SETUP_CODE is not set. Set SETUP_CODE in .env to enroll your first device.');
+  }
+  if (!isSecureOrigin && rpId !== 'localhost') {
+    logger.warn('APP_ORIGIN is %s. Passkeys and installing the app need HTTPS (or localhost).', config.appOrigin);
+  }
+
+  const app = await buildServer();
+  await app.listen({ port: config.port, host: config.host });
+  startReconciler();
+
+  logger.info('Easy-Send is running at %s', config.appOrigin);
+
+  const shutdown = async () => {
+    logger.info('Shutting down...');
+    stopReconciler();
+    await app.close().catch(() => undefined);
+    closeDb();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
-function shutdown() {
-  logger.info('Shutting down...');
-  stopWhatsapp();
-  closeDb();
-  process.exit(0);
-}
-
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-process.on('uncaughtException', (err) => {
-  logger.fatal(err, 'Uncaught exception');
-  closeDb();
-  process.exit(1);
-});
-
-main().catch((err) => {
+main().catch(err => {
   logger.fatal(err, 'Failed to start');
   process.exit(1);
 });

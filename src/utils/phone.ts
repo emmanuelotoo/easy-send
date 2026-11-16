@@ -26,6 +26,11 @@ export function toLocal(phone: string): string {
   return `${local.slice(0, 3)} ${local.slice(3, 6)} ${local.slice(6)}`;
 }
 
+/** Local digits with no spaces, e.g. "0241234567": the format Paystack's Ghana examples use. */
+export function toLocalDigits(phone: string): string {
+  return '0' + toInternational(phone).slice(3);
+}
+
 /** Ghana mobile money networks supported for transfers. */
 export type Network = 'mtn' | 'telecel' | 'airteltigo';
 
