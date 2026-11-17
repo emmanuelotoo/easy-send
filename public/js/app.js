@@ -223,7 +223,7 @@ function gateScreen(pairing = false) {
         'main',
         { class: 'gate' },
         logo,
-        h('h1', {}, setupRequired ? 'Set up Easy-Send' : 'Pair this device'),
+        h('h1', {}, setupRequired ? ['Set up ', h('span', { class: 'nowrap' }, 'Easy-Send')] : 'Pair this device'),
         h(
           'p',
           {},
@@ -627,7 +627,7 @@ function fact(label, value, extraClass = '') {
 
 function heroAmount(pesewas) {
   const { whole, frac } = moneyParts(pesewas);
-  return h('div', { class: 'hero-amount' }, h('span', { class: 'cur' }, 'GHS'), `${whole}.${frac}`);
+  return h('div', { class: 'hero-amount' }, h('span', { class: 'cur' }, 'GHS'), whole, h('span', { class: 'frac' }, `.${frac}`));
 }
 
 function retryHash(tx) {
