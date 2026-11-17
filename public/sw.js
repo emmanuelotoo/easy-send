@@ -1,9 +1,12 @@
 // App-shell cache. Money never touches this file: every /api call goes straight
 // to the network, so balances and transfer states are never served stale.
-const VERSION = 'easy-send-v1';
+const VERSION = 'easy-send-v2';
 const SHELL = [
   '/',
   '/styles.css',
+  '/fonts/geist.woff2',
+  '/fonts/instrument-serif.woff2',
+  '/fonts/instrument-serif-italic.woff2',
   '/js/app.js',
   '/js/lib.js',
   '/js/webauthn.js',
